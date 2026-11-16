@@ -1,0 +1,37 @@
+diff --git a/bsd/dev/herolte_touch.c b/bsd/dev/herolte_touch.c
+index 9812073..c9059c2 100644
+--- a/bsd/dev/herolte_touch.c
++++ b/bsd/dev/herolte_touch.c
+@@ -658,10 +658,31 @@ apm_touch_power_on(void)
+ 		return false;
+ 	}
+ 	printf("HEROLTE APM: S2MPS16 id=%#x L32CTRL=%#x L33CTRL=%#x\n", id, l32, l33);
+-	if ((l32 & 0x3fu) != S2MPS16_SEL_1V85 || (l33 & 0x3fu) != S2MPS16_SEL_3V3) {
++	/*
++	 * After TWRP, Linux has already set tsp_io to 1.85 V (0x2e). Without it
++	 * (0346: cold start, reboot from iOS) LDO32 holds the PMIC's own 1.80 V
++	 * (0x2c; 700 mV + 25 mV steps). As Linux's regulator_set_voltage before
++	 * regulator_enable: 1.80-1.85 V is moved to 1.85 V while still off;
++	 * anything else is still refused.
++	 */
++	uint8_t sel32 = l32 & 0x3fu;
++	if (sel32 < S2MPS16_SEL_1V85 - 2 || sel32 > S2MPS16_SEL_1V85 || (l33 & 0x3fu) != S2MPS16_SEL_3V3) {
+ 		printf("HEROLTE APM: unexpected LDO32/33 voltage, leaving them off\n");
+ 		return false;
+ 	}
++	if (sel32 != S2MPS16_SEL_1V85) {
++		if (l32 & S2MPS16_ENABLE) {
++			printf("HEROLTE APM: LDO32 already on at %#x, leaving its voltage\n", sel32);
++		} else {
++			uint8_t v = (uint8_t)((l32 & ~0x3fu) | S2MPS16_SEL_1V85);
++			if (!apm_pmic_write(S2MPS16_L32CTRL, v) || !apm_pmic_read(S2MPS16_L32CTRL, &l32) ||
++			    (l32 & 0x3fu) != S2MPS16_SEL_1V85) {
++				printf("HEROLTE APM: LDO32 to 1.85 V failed (%#x)\n", l32);
++				return false;
++			}
++			printf("HEROLTE APM: LDO32 set to 1.85 V (was %#x)\n", sel32);
++		}
++	}
+ 	printf("HEROLTE APM: enabling LDO32/LDO33 in 11 s\n");
+ 	ht_checkpoint();
+ 	if (!(l32 & S2MPS16_ENABLE) && !apm_pmic_write(S2MPS16_L32CTRL, l32 | S2MPS16_ENABLE)) {
