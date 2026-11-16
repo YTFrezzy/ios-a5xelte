@@ -240,6 +240,34 @@ heic_census_thread(void *unused)
    return NULL;
 }
 
+/*
+ * mediaserverd (boot logs of an SM-G930W8, 55-69 a boot): at its start CMCapture warms up the Portrait filter,
+ * +[BWCoreImageFilterRenderer _prewarmCoreImagePortraitFilterV1] -> prepareForRenderingWithParameters: -> context:err: ->
+ * +[CIContext contextWithOptions:] -> internalContextWithEAGLContext:options:, and CoreImage jumps to address 0 even with
+ * the software renderer asked for above. It crashes and launchd starts it again, over and over. Portrait needs the rear
+ * camera, which this port does not have: the warm-up does nothing. The drop zone's ciprewarm.on leaves it as it was.
+ */
+static void
+no_prewarm(id self, SEL command)
+{
+   (void)self;
+   (void)command;
+   herodrm_log("mediaserverd: Portrait filter warm-up skipped");
+}
+
+static void
+skip_portrait_prewarm(void)
+{
+   if (access("/private/var/herolte/ciprewarm.on", F_OK) == 0)
+      return;
+   dlopen("/System/Library/PrivateFrameworks/CMCapture.framework/CMCapture", RTLD_LAZY);
+   Method prewarm = class_getClassMethod(objc_getClass("BWCoreImageFilterRenderer"),
+                                         sel_registerName("_prewarmCoreImagePortraitFilterV1"));
+   if (prewarm != NULL)
+      method_setImplementation(prewarm, (IMP)no_prewarm);
+   herodrm_log("mediaserverd: Portrait filter warm-up %s", prewarm != NULL ? "replaced" : "not found");
+}
+
 __attribute__((constructor)) static void
 install(void)
 {
@@ -258,6 +286,7 @@ install(void)
          void *cam = dlopen("/private/var/herolte/lib/libnotefecam.dylib", RTLD_NOW);
          herodrm_log("mediaserverd: libnotefecam %s", cam ? "loaded" : dlerror());
       }
+      skip_portrait_prewarm();
    }
    if (strcmp(getprogname(), "CollectionsPoster") == 0) {
       pthread_t census;
