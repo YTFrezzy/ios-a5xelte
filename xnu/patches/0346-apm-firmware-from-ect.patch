@@ -1,0 +1,181 @@
+diff --git a/bsd/dev/herolte_touch.c b/bsd/dev/herolte_touch.c
+index a2772e1..9812073 100644
+--- a/bsd/dev/herolte_touch.c
++++ b/bsd/dev/herolte_touch.c
+@@ -22,6 +22,7 @@
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include <libkern/libkern.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
+@@ -384,11 +385,149 @@ pm_touch_power_on(void)
+ 
+ static vm_offset_t apm_pmu, apm_mbox;
+ 
++/*
++ * The APM firmware, as Linux loads it (mailbox-exynos8.c firmware_update):
++ * not a file but the "APMFW" binary in the BIN block of the ECT, the
++ * parameter table S-Boot leaves in RAM on every boot (herolte DTS
++ * ect { parameter_address = 0xA0000000; parameter_size = 0x19000; },
++ * kept out of XNU's banks). Linux copies it to the APM SRAM at probe, so
++ * after TWRP the SRAM holds it; after a cold start or a reboot from iOS it
++ * does not, the M3 never answers and the touch panel has no supply.
++ *
++ * ECT layout (ect_parser.c): "PARA", version[4], total_size, num_of_header,
++ * then per block a string and its offset from the ECT start. A string is a
++ * u32 length, then length + 1 bytes padded to 4. BIN block: parser_version,
++ * version, num_of_binary, then per binary a string and its offset from the
++ * block; at that offset a u32 size and the bytes.
++ *
++ * Only when the SRAM differs from APMFW: hold the M3 (APM_CONFIG run and
++ * APM_OPTION ENABLE_APM cleared, as exynos8890_apm_power_down), copy, read
++ * back. apm_start() then releases it as before. heroapmfw=0 skips this.
++ */
++#define APM_SRAM_PA     0x11200000u
++#define APM_SRAM_SIZE   0x40000u
++#define ECT_PA          0xa0000000u
++#define ECT_SIZE        0x19000u
++
++/* An ECT string at *off: its bytes (not mapped twice) and the next offset. */
++static bool
++ect_string(vm_offset_t ect, uint32_t *off, char *out, unsigned outlen)
++{
++	if (*off + 4 > ECT_SIZE) {
++		return false;
++	}
++	uint32_t len = ht_rd(ect, *off) + 1;   /* with its NUL */
++	if (len > 64 || *off + 4 + len > ECT_SIZE) {
++		return false;
++	}
++	for (unsigned i = 0; i < outlen; i++) {
++		out[i] = i < len ? *(volatile char *)(ect + *off + 4 + i) : 0;
++	}
++	out[outlen - 1] = 0;
++	*off += 4 + ((len + 3) & ~3u);
++	return true;
++}
++
++static void
++apm_load_firmware(void)
++{
++	int enabled = 1;
++	PE_parse_boot_argn("heroapmfw", &enabled, sizeof(enabled));
++	if (!enabled) {
++		printf("HEROLTE APM FW: heroapmfw=0, SRAM left as found\n");
++		return;
++	}
++	vm_offset_t ect = ml_io_map(ECT_PA, ECT_SIZE);
++	vm_offset_t sram = ml_io_map(APM_SRAM_PA, APM_SRAM_SIZE);
++	if (!ect || !sram) {
++		printf("HEROLTE APM FW: mapping failed\n");
++		return;
++	}
++	if (ht_rd(ect, 0) != 0x41524150u) {    /* "PARA" */
++		printf("HEROLTE APM FW: no ECT at %#x (sign %#x)\n", ECT_PA, ht_rd(ect, 0));
++		return;
++	}
++	char name[16];
++	uint32_t off = 16, bin = 0, nblocks = ht_rd(ect, 12);
++	for (uint32_t i = 0; i < nblocks && i < 32; i++) {
++		if (!ect_string(ect, &off, name, sizeof(name)) || off + 4 > ECT_SIZE) {
++			printf("HEROLTE APM FW: ECT header unreadable at block %u\n", i);
++			return;
++		}
++		uint32_t at = ht_rd(ect, off);
++		off += 4;
++		if (strcmp(name, "BIN") == 0) {
++			bin = at;
++		}
++	}
++	if (!bin || bin + 12 > ECT_SIZE) {
++		printf("HEROLTE APM FW: no BIN block in the ECT (%u blocks)\n", nblocks);
++		return;
++	}
++	uint32_t fw = 0, size = 0, nbin = ht_rd(ect, bin + 8);
++	off = bin + 12;
++	for (uint32_t i = 0; i < nbin && i < 16; i++) {
++		if (!ect_string(ect, &off, name, sizeof(name)) || off + 4 > ECT_SIZE) {
++			printf("HEROLTE APM FW: BIN block unreadable at binary %u\n", i);
++			return;
++		}
++		uint32_t at = ht_rd(ect, off);
++		off += 4;
++		if (strcmp(name, "APMFW") == 0 && bin + at + 4 <= ECT_SIZE) {
++			size = ht_rd(ect, bin + at);
++			fw = bin + at + 4;
++		}
++	}
++	if (!fw || size < 64 || size > APM_SRAM_SIZE || fw + size > ECT_SIZE) {
++		printf("HEROLTE APM FW: no usable APMFW in the ECT (offset %#x, %u bytes)\n", fw, size);
++		return;
++	}
++	/* A Cortex-M3 vector table: initial SP inside the SRAM, Thumb reset vector inside the image. */
++	uint32_t sp = ht_rd(ect, fw), reset = ht_rd(ect, fw + 4);
++	if (sp == 0 || sp > APM_SRAM_SIZE || !(reset & 1u) || reset >= size) {
++		printf("HEROLTE APM FW: APMFW is not a vector table (sp %#x reset %#x); not loading\n", sp, reset);
++		return;
++	}
++	uint32_t words = size / 4, diff = 0;
++	for (uint32_t i = 0; i < words; i++) {
++		if (ht_rd(sram, i * 4) != ht_rd(ect, fw + i * 4)) {
++			diff++;
++		}
++	}
++	printf("HEROLTE APM FW: ECT APMFW %u bytes (sp %#x reset %#x); SRAM differs in %u of %u words\n",
++	    size, sp, reset, diff, words);
++	if (diff == 0) {
++		return;         /* TWRP/Linux loaded it: leave the M3 as it is */
++	}
++	printf("HEROLTE APM FW: holding the M3 (config=%#x option=%#x) and loading\n",
++	    ht_rd(apm_pmu, APM_CONFIG), ht_rd(apm_pmu, APM_OPTION));
++	ht_wr(apm_pmu, APM_OPTION, ht_rd(apm_pmu, APM_OPTION) & ~(1u << 15));
++	ht_wr(apm_pmu, APM_CONFIG, ht_rd(apm_pmu, APM_CONFIG) & ~1u);
++	ht_msleep(10);
++	for (uint32_t i = 0; i < words; i++) {
++		ht_wr(sram, i * 4, ht_rd(ect, fw + i * 4));
++	}
++	for (uint32_t i = words * 4; i < size; i++) {
++		*(volatile uint8_t *)(sram + i) = *(volatile uint8_t *)(ect + fw + i);
++	}
++	diff = 0;
++	for (uint32_t i = 0; i < words; i++) {
++		if (ht_rd(sram, i * 4) != ht_rd(ect, fw + i * 4)) {
++			diff++;
++		}
++	}
++	printf("HEROLTE APM FW: loaded; readback differs in %u words\n", diff);
++}
++
+ static bool
+ apm_start(void)
+ {
+-	apm_pmu = ml_io_map(APM_PMU_PA, 0x4000);
+-	apm_mbox = ml_io_map(APM_MBOX_PA, 0x1000);
++	if (!apm_pmu) {
++		apm_pmu = ml_io_map(APM_PMU_PA, 0x4000);
++	}
++	if (!apm_mbox) {
++		apm_mbox = ml_io_map(APM_MBOX_PA, 0x1000);
++	}
+ 	if (!apm_pmu || !apm_mbox) {
+ 		printf("HEROLTE APM: mapping failed\n");
+ 		return false;
+@@ -831,6 +970,16 @@ herolte_touch_probe(void)
+ 		printf("HEROLTE TOUCH: MMIO mapping failed\n");
+ 		return;
+ 	}
++	/*
++	 * Here, before launchd: backboardd's default surface later lives at
++	 * 0xa0000000 too (0276, Note FE zero-copy), over the ECT.
++	 */
++	if (enabled != 2) {
++		apm_pmu = ml_io_map(APM_PMU_PA, 0x4000);
++		if (apm_pmu) {
++			apm_load_firmware();
++		}
++	}
+ 	if (kernel_thread_start(ht_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}
