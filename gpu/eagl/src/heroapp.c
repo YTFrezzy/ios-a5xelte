@@ -255,17 +255,38 @@ no_prewarm(id self, SEL command)
    herodrm_log("mediaserverd: Portrait filter warm-up skipped");
 }
 
+/*
+ * The CIContext that CoreImage builds over an EAGLContext is the one that jumps to 0 (here none can be made, see
+ * no_context): in mediaserverd it is refused, nil, as CoreImage does when it cannot make one; CMCapture's
+ * +[BWCoreImageFilterRenderer context:err:] has its error path for that.
+ */
+static id
+no_eagl_ci_context(id self, SEL command, id eagl, id options)
+{
+   (void)self;
+   (void)command;
+   herodrm_log("mediaserverd: CIContext over EAGLContext %p refused (options %s)", (void *)eagl, text_of(options));
+   return nil;
+}
+
 static void
 skip_portrait_prewarm(void)
 {
    if (access("/private/var/herolte/ciprewarm.on", F_OK) == 0)
       return;
-   dlopen("/System/Library/PrivateFrameworks/CMCapture.framework/CMCapture", RTLD_LAZY);
-   Method prewarm = class_getClassMethod(objc_getClass("BWCoreImageFilterRenderer"),
-                                         sel_registerName("_prewarmCoreImagePortraitFilterV1"));
+   Method eagl_ci = class_getClassMethod(objc_getClass("CIContext"),
+                                         sel_registerName("internalContextWithEAGLContext:options:"));
+   if (eagl_ci != NULL)
+      method_setImplementation(eagl_ci, (IMP)no_eagl_ci_context);
+   herodrm_log("mediaserverd: CIContext over EAGLContext %s", eagl_ci != NULL ? "refused" : "not found");
+   void *capture = dlopen("/System/Library/PrivateFrameworks/CMCapture.framework/CMCapture", RTLD_NOW);
+   Class renderer = objc_getClass("BWCoreImageFilterRenderer");
+   Method prewarm = renderer != Nil ? class_getClassMethod(renderer, sel_registerName("_prewarmCoreImagePortraitFilterV1"))
+                                    : NULL;
    if (prewarm != NULL)
       method_setImplementation(prewarm, (IMP)no_prewarm);
-   herodrm_log("mediaserverd: Portrait filter warm-up %s", prewarm != NULL ? "replaced" : "not found");
+   herodrm_log("mediaserverd: Portrait filter warm-up %s (CMCapture %s, class %s)", prewarm != NULL ? "replaced" : "not found",
+               capture ? "loaded" : dlerror(), renderer != Nil ? "found" : "missing");
 }
 
 __attribute__((constructor)) static void
@@ -286,7 +307,6 @@ install(void)
          void *cam = dlopen("/private/var/herolte/lib/libnotefecam.dylib", RTLD_NOW);
          herodrm_log("mediaserverd: libnotefecam %s", cam ? "loaded" : dlerror());
       }
-      skip_portrait_prewarm();
    }
    if (strcmp(getprogname(), "CollectionsPoster") == 0) {
       pthread_t census;
@@ -321,6 +341,8 @@ install(void)
       ci_init_original = (id (*)(id, SEL, id))method_setImplementation(init, (IMP)ci_init);
    }
    herodrm_log("%s: libheroapp: CoreImage %s", getprogname(), ci_init_original ? "in software" : "as it was");
+   if (strcmp(getprogname(), "mediaserverd") == 0)
+      skip_portrait_prewarm();          /* after CoreImage is loaded: CIContext is there */
    Method assertion = class_getInstanceMethod(objc_getClass("NSAssertionHandler"),
       sel_registerName("handleFailureInMethod:object:file:lineNumber:description:"));
    if (assertion != NULL) {
